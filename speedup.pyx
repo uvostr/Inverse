@@ -1,5 +1,6 @@
 import numpy as np
 cimport numpy as np
+import math
 from cython import boundscheck, wraparound
 from libc.math cimport cos, sin, signbit
 from cython.parallel cimport prange, parallel
@@ -145,7 +146,7 @@ def create_I_vector(m, u, v, I_layers):
     I_vector[j] = I_layers[u][v][j]
   return I_vector
 
-def regul(k, mu, m, u, v, I_layers, H_layers):
+def regul_implicit(k, mu, m, u, v, I_layers, H_layers):
   H = create_H_matrix(m, u, v, H_layers)
   I = create_I_vector(m, u, v, I_layers)
   E = np.eye(m)
@@ -159,7 +160,7 @@ def regul(k, mu, m, u, v, I_layers, H_layers):
 
 @boundscheck(False)
 @wraparound(False)
-def solve_inverse(out, dim, m, w_, mu, k):
+def solve_inverse_implicit(out, dim, m, w_, mu, k):
     h = generate_psf(dim, m, w_)
 
 
@@ -187,7 +188,7 @@ def solve_inverse(out, dim, m, w_, mu, k):
     cdef np.ndarray result = np.zeros((ext_dim, ext_dim, m), complex)
     for u in range(ext_dim):
         for v in range(ext_dim):
-          tmp = regul(k, mu, m, u, v, ext_out, ext_h)
+          tmp = regul_implicit(k, mu, m, u, v, ext_out, ext_h)
           for i in range(m):
             result[u][v][i] = tmp[i]
 
@@ -198,8 +199,165 @@ def solve_inverse(out, dim, m, w_, mu, k):
 
 
 
+def regul_explicit(k, mu, m, u, v, I_layers, H_layers):
+  H = create_H_matrix(m, u, v, H_layers)
+  I = create_I_vector(m, u, v, I_layers)
+  E = np.eye(m)
+  O = np.zeros(m)
+  tmp1 = E - mu * (H.real.T - H.imag.T).dot(H)
+  tmp2 = mu * (H.real.T - H.imag.T).dot(I)
+  for j in range(k):
+    O = tmp1.dot(O) + tmp2
+  return O
+
+@boundscheck(False)
+@wraparound(False)
+def solve_inverse_explicit(out, dim, m, w_, mu, k):
+    h = generate_psf(dim, m, w_)
+    
 
 
+    cdef int ext_dim = dim * 2 - 1
+    cdef int cut_dim_s = dim / 2
+    cdef int cut_dim_f = 3 * dim / 2
+
+    cdef np.ndarray ext_h = np.zeros((ext_dim, ext_dim, 2 * m - 1), dtype=np.complex)
+    cdef np.ndarray ext_out = np.zeros((ext_dim, ext_dim, m), dtype=np.complex)
+
+    h = generate_psf(dim, m, w_)
+
+    for l in range(m):
+        ext_out[cut_dim_s:cut_dim_f, cut_dim_s:cut_dim_f, l] = out[:, :, l]
+    for l in range(2 * m - 1):
+        ext_h[:dim, :dim, l] = h[:, :, l]
+
+    for l in range(m):
+        ext_out[:, :, l] = np.fft.fft2(ext_out[:, :, l])
+    for l in range(2 * m - 1):
+        ext_h[:, :, l] = np.fft.fft2(ext_h[:, :, l])
+
+
+
+    cdef np.ndarray result = np.zeros((ext_dim, ext_dim, m), complex)
+    for u in range(ext_dim):
+        for v in range(ext_dim):
+          tmp = regul_explicit(k, mu, m, u, v, ext_out, ext_h)
+          for i in range(m):
+            result[u][v][i] = tmp[i]
+
+    for i in range(m):
+        result[:,:,i] = np.fft.ifft2(result[:,:,i])
+
+    return result.real
+
+
+@boundscheck(False)
+@wraparound(False)
+def rings_array(dim):
+  rings_array = np.zeros((dim * 2 - 1, dim * 2 - 1), int)
+  for u in range(dim * 2 - 1):
+    for v in range(dim * 2 - 1):
+      tmp = np.sqrt((u - dim + 1) ** 2 + (v - dim + 1) ** 2)
+      rings_array[u][v] = int(math.floor(tmp))
+  return rings_array
+
+
+@boundscheck(False)
+@wraparound(False)
+def solve_inverse_implicit_split(out, dim, m, w_, mu1, k1, mu2, k2, r):
+    h = generate_psf(dim, m, w_)
+    
+    rings = rings_array(dim)
+
+    cdef int ext_dim = dim * 2 - 1
+    cdef int cut_dim_s = dim / 2
+    cdef int cut_dim_f = 3 * dim / 2
+
+    cdef np.ndarray ext_h = np.zeros((ext_dim, ext_dim, 2 * m - 1), dtype=np.complex)
+    cdef np.ndarray ext_out = np.zeros((ext_dim, ext_dim, m), dtype=np.complex)
+
+    h = generate_psf(dim, m, w_)
+
+    for l in range(m):
+        ext_out[cut_dim_s:cut_dim_f, cut_dim_s:cut_dim_f, l] = out[:, :, l]
+    for l in range(2 * m - 1):
+        ext_h[:dim, :dim, l] = h[:, :, l]
+
+    for l in range(m):
+        ext_out[:, :, l] = np.fft.fft2(ext_out[:, :, l])
+    for l in range(2 * m - 1):
+        ext_h[:, :, l] = np.fft.fft2(ext_h[:, :, l])
+
+
+
+    cdef np.ndarray result = np.zeros((ext_dim, ext_dim, m), complex)
+    for u in range(ext_dim):
+        for v in range(ext_dim):
+          if(rings[u][v] >= r):
+              tmp = regul_implicit(k2, mu2, m, u, v, ext_out, ext_h)
+          else:
+              tmp = regul_implicit(k1, mu1, m, u, v, ext_out, ext_h)
+          for i in range(m):
+            result[u][v][i] = tmp[i]
+
+    for i in range(m):
+        result[:,:,i] = np.fft.ifft2(result[:,:,i])
+
+    return result.real
+
+
+def rings_array_VFC(dim):
+  #радиус вписанного кольца в котором находится точка, -1 если не лежит во вписанном кольце\ 1 если лежит в двух кольцах(полный квадрат), 0 иначе
+  rings = np.zeros((dim * 2 - 1, dim * 2 - 1, 2), int)
+  for u in range(dim * 2 - 1):
+    for v in range(dim * 2 - 1): 
+      tmp = np.sqrt((u - dim + 1) ** 2 + (v - dim + 1) ** 2)
+      if(tmp <= dim):
+        if(tmp % 1 == 0):
+          rings[u][v][1] = 1
+        rings[u][v][0] = int(math.floor(tmp))
+      else:
+        rings[u][v][0] = -1
+  return rings
+
+def VFC(original, recovered, rings, dim):
+  original = original / np.var(original)
+  original = original / np.mean(original)
+  original = np.fft.fft2(original)
+  original = original / np.max(original)
+  recovered = recovered + np.abs(np.amin(recovered))
+  recovered = recovered / np.var(recovered)
+  recovered = recovered / np.mean(recovered)
+  recovered = np.fft.fft2(recovered)
+  recovered = recovered / np.max(recovered)
+  tmp = recovered / original
+  tmp = np.abs(tmp)
+  res = np.zeros((4, dim)) #радиус, сумма, количество, сумма/количество
+  res[0] = np.arange(0, dim, 1)
+  for u in range(dim * 2 - 1):
+    for v in range(dim * 2 - 1):
+        j = rings[u][v][0]
+        if(j > 0):
+          if(rings[u][v][1] == 1):
+            res[1][j - 1] += tmp[u][v]
+            res[2][j - 1] += 1
+          res[1][j] += tmp[u][v]
+          res[2][j] += 1
+  for i in range(dim):
+    if(res[2][i] > 0):
+      res[3][i] = res[1][i] / res[2][i]
+    else:
+      res[3][i] = 0
+  x_plot = res[0]
+  y_plot = res[3]
+  return x_plot, y_plot
+
+def recovery_quality(original, recovered, dim):
+  extended_o = np.zeros((dim * 2 - 1, dim * 2 - 1))
+  extended_o[:dim, :dim] = original
+  rings = rings_array_VFC(dim)
+  x_plot, y_plot = VFC(extended_o, recovered, rings, dim)
+  return x_plot, y_plot
 
 
 
