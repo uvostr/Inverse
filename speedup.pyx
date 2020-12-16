@@ -1,6 +1,7 @@
 import numpy as np
 cimport numpy as np
 import math
+import random
 from cython import boundscheck, wraparound
 from libc.math cimport cos, sin, signbit
 from cython.parallel cimport prange, parallel
@@ -25,7 +26,7 @@ cpdef real_t p_func(real_t x, real_t y, real_t a):
 
 @boundscheck(False)
 @wraparound(False)
-cpdef generate_psf(int dim, int m, real_t w_):
+cpdef generate_psf(int dim, int m, real_t w_, real_t stationary_defocus):
     cdef:
         
         w = w_ * 2.34 * 0.001
@@ -73,7 +74,7 @@ cpdef generate_psf(int dim, int m, real_t w_):
         layer = l - m + 1
         for i in range(dim_x):
             for j in range(dim_y):
-                temp = p_func(x[i], y[j], ps_value * (layer) / (m-1)) + p_func(x[i], y[j], ps_value * 0.05)
+                temp = p_func(x[i], y[j], ps_value * (layer) / (m-1)) + p_func(x[i], y[j], ps_value * stationary_defocus)
                 inner_h_view[i, j] = m_func(x[i], y[j], R, n_coef) * (cos(temp) + 1j * sin(temp))
 
         fft_inner_h = np.fft.fft2(inner_h)
@@ -91,14 +92,14 @@ cpdef generate_psf(int dim, int m, real_t w_):
 
 @boundscheck(False)
 @wraparound(False)
-cpdef generate_out_images(int dim, int m, real_t w_, np.ndarray[double, ndim=3] src):
+cpdef generate_out_images(int dim, int m, real_t w_,  real_t stationary_defocus, np.ndarray[double, ndim=3] src):
 
     cdef int ext_dim = dim * 2 - 1
     cdef int cut_dim_s = dim / 2
     cdef int cut_dim_f = 3 * dim / 2
     cdef np.ndarray h = np.zeros((dim, dim, 2 * m - 1), dtype=np.double)
     cdef np.ndarray out = np.zeros((dim, dim, m), dtype=np.double)
-    h = generate_psf(dim, m, w_)
+    h = generate_psf(dim, m, w_, stationary_defocus)
     cdef np.ndarray ext_h = np.zeros((ext_dim, ext_dim, 2 * m - 1), dtype=np.complex)
     cdef np.ndarray ext_src = np.zeros((ext_dim, ext_dim, m), dtype=np.complex)
     cdef np.ndarray ext_out = np.zeros((ext_dim, ext_dim, m), dtype=np.complex)
@@ -112,7 +113,7 @@ cpdef generate_out_images(int dim, int m, real_t w_, np.ndarray[double, ndim=3] 
         ext_src[:, :, l] = np.fft.fft2(ext_src[:, :, l])
     for l in range(2 * m - 1):
         ext_h[:, :, l] = np.fft.fft2(ext_h[:, :, l])
-
+        
     for k in range(m):
         for l in range(m):
             ext_out[:, :, k] = ext_out[:, :, k] + \
@@ -131,6 +132,47 @@ cpdef generate_out_images(int dim, int m, real_t w_, np.ndarray[double, ndim=3] 
     bytes_out = (255 * out).astype(np.ubyte)
 
     return out, bytes_out
+
+@boundscheck(False)
+@wraparound(False)
+cpdef generate_out_images_gaussian_noise(int dim, int m, real_t w_, real_t stationary_defocus, np.ndarray[double, ndim=3] src, real_t noise_level):
+    i = generate_out_images(dim, m, w_, stationary_defocus, src)[0]
+    i_gaussian_noise = np.zeros((dim, dim, m))
+    max_amp = np.max(i) - np.min(i)
+    for j in range(m):
+        for u in range(dim):
+            for v in range(dim):
+                i_gaussian_noise[u, v, j] = i[u, v, j] + random.gauss(0, 1) * max_amp * noise_level
+    if np.min(i_gaussian_noise) < 0:
+        i_gaussian_noise = i_gaussian_noise + abs(np.min(i_gaussian_noise))
+    i_gaussian_noise = i_gaussian_noise / np.max(i_gaussian_noise)
+    return i_gaussian_noise
+
+@boundscheck(False)
+@wraparound(False)
+cpdef generate_out_images_shot_noise(int dim, int m, real_t w_, real_t stationary_defocus, np.ndarray[double, ndim=3] src, real_t k):
+    i = generate_out_images(dim, m, w_, stationary_defocus, src)[0]
+    i_shot_noise = np.zeros((dim, dim, m))
+    for j in range(m):
+        for u in range(dim):
+            for v in range(dim):
+                i_shot_noise[u, v, j] = np.random.poisson(i[u, v, j] * k) / k
+    i_shot_noise = i_shot_noise / np.max(i_shot_noise)
+    return i_shot_noise
+
+@boundscheck(False)
+@wraparound(False)
+cpdef generate_out_images_noise(int dim, int m, real_t w_, real_t stationary_defocus, np.ndarray[double, ndim=3] src, real_t noise_level, real_t k):
+    i = generate_out_images(dim, m, w_, stationary_defocus, src)[0]   
+    i_noise = np.zeros((dim, dim, m))
+    max_amp = np.max(i) - np.min(i)
+    for j in range(m):
+        for u in range(dim):
+            for v in range(dim):
+                i_noise[u, v, j] = np.random.poisson(i[u, v, j] * k) / k + random.gauss(0, 1) * max_amp * noise_level
+    i_noise = i_noise / np.max(i_noise)
+    return i_noise
+    
 
 
 def create_H_matrix(m, u, v, H_layers):
@@ -160,8 +202,8 @@ def regul_implicit(k, mu, m, u, v, I_layers, H_layers):
 
 @boundscheck(False)
 @wraparound(False)
-def solve_inverse_implicit(out, dim, m, w_, mu, k):
-    h = generate_psf(dim, m, w_)
+def solve_inverse_implicit(out, dim, m, w_, stationary_defocus, mu, k):
+    h = generate_psf(dim, m, w_, stationary_defocus)
 
 
     cdef int ext_dim = dim * 2 - 1
@@ -171,7 +213,6 @@ def solve_inverse_implicit(out, dim, m, w_, mu, k):
     cdef np.ndarray ext_h = np.zeros((ext_dim, ext_dim, 2 * m - 1), dtype=np.complex)
     cdef np.ndarray ext_out = np.zeros((ext_dim, ext_dim, m), dtype=np.complex)
 
-    h = generate_psf(dim, m, w_)
 
     for l in range(m):
         ext_out[cut_dim_s:cut_dim_f, cut_dim_s:cut_dim_f, l] = out[:, :, l]
@@ -212,11 +253,8 @@ def regul_explicit(k, mu, m, u, v, I_layers, H_layers):
 
 @boundscheck(False)
 @wraparound(False)
-def solve_inverse_explicit(out, dim, m, w_, mu, k):
-    h = generate_psf(dim, m, w_)
+def solve_inverse_explicit(out, dim, m, w_, stationary_defocus, mu, k):
     
-
-
     cdef int ext_dim = dim * 2 - 1
     cdef int cut_dim_s = dim / 2
     cdef int cut_dim_f = 3 * dim / 2
@@ -224,7 +262,7 @@ def solve_inverse_explicit(out, dim, m, w_, mu, k):
     cdef np.ndarray ext_h = np.zeros((ext_dim, ext_dim, 2 * m - 1), dtype=np.complex)
     cdef np.ndarray ext_out = np.zeros((ext_dim, ext_dim, m), dtype=np.complex)
 
-    h = generate_psf(dim, m, w_)
+    h = generate_psf(dim, m, w_, stationary_defocus)
 
     for l in range(m):
         ext_out[cut_dim_s:cut_dim_f, cut_dim_s:cut_dim_f, l] = out[:, :, l]
@@ -264,8 +302,8 @@ def rings_array(dim):
 
 @boundscheck(False)
 @wraparound(False)
-def solve_inverse_implicit_split(out, dim, m, w_, mu1, k1, mu2, k2, r):
-    h = generate_psf(dim, m, w_)
+def solve_inverse_implicit_split(out, dim, m, w_, stationary_defocus, mu1, k1, mu2, k2, r):
+    h = generate_psf(dim, m, w_, stationary_defocus)
     
     rings = rings_array(dim)
 
@@ -275,8 +313,6 @@ def solve_inverse_implicit_split(out, dim, m, w_, mu1, k1, mu2, k2, r):
 
     cdef np.ndarray ext_h = np.zeros((ext_dim, ext_dim, 2 * m - 1), dtype=np.complex)
     cdef np.ndarray ext_out = np.zeros((ext_dim, ext_dim, m), dtype=np.complex)
-
-    h = generate_psf(dim, m, w_)
 
     for l in range(m):
         ext_out[cut_dim_s:cut_dim_f, cut_dim_s:cut_dim_f, l] = out[:, :, l]
